@@ -4,7 +4,7 @@ from flask_cors import CORS
 
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://Gachenge:pythonroot@Gachenge.mysql.pythonanywhere-services.com/Gachenge$orders'
+app.config['SQLALCHEMY_DATABASE_URI'] = ''
 
 db = SQLAlchemy(app)
 
