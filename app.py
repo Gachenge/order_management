@@ -1,13 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from dotenv import load_dotenv
-import os
+from flask_cors import CORS
 
-load_dotenv(".env")
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('SQLALCHEMY_DATABASE_URI')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://Gachenge:pythonroot@Gachenge.mysql.pythonanywhere-services.com/Gachenge$orders'
+
 db = SQLAlchemy(app)
+
+# Initialize CORS
+CORS(app, supports_credentials=True)
 
 # Define Models
 class Customer(db.Model):
@@ -26,16 +28,22 @@ class Product(db.Model):
     created_at = db.Column(db.TIMESTAMP, server_default=db.func.current_timestamp())
 
 class Order(db.Model):
+    __tablename__ = 'orders'
     order_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    customer_id = db.Column(db.Integer, db.ForeignKey('customer.customer_id'), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey('product.product_id'), nullable=False)
+    customer_id = db.Column(db.Integer, db.ForeignKey('customers.customer_id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.product_id'), nullable=False)
     quantity = db.Column(db.Integer, nullable=False)
     created_at = db.Column(db.TIMESTAMP, server_default=db.func.current_timestamp())
+
+    __table_args__ = (
+        db.UniqueConstraint('customer_id', 'product_id', 'created_at', name='uq_customer_product_timestamp'),
+    )
 
 
 @app.route('/orders', methods=['POST'])
 def create_order():
     data = request.get_json()
+    required_attributes = []
     new_order = Order(**data)
     db.session.add(new_order)
     db.session.commit()
@@ -45,9 +53,11 @@ def create_order():
 @app.route('/orders')
 def get_all_orders():
     orders = Order.query.all()
+    if orders is None or len(orders) == 0:
+        return (error_response("orders not found"), 404)
     return jsonify({'orders': [{'order_id': order.order_id, 'customer_id': order.customer_id,
                                 'product_id': order.product_id, 'quantity': order.quantity,
-                                'created_at': order.created_at} for order in orders]})
+                                'created_at': order.created_at} for order in orders]}), 200
 
 # Get order by ID
 @app.route('/orders/<int:order_id>')
@@ -66,10 +76,21 @@ def update_order(order_id):
     order = Order.query.get(order_id)
     if order:
         data = request.get_json()
-        order.customer_id = data.get('customer_id', order.customer_id)
-        order.product_id = data.get('product_id', order.product_id)
+        if data is None or 'customer_email' not in data or 'product_name' not in data or 'quantity' not in data:
+            return jsonify({"Error": "Missing required data (customer_email, product_name, quantity)"}), 400
+
+        customer = Customer.query.filter_by(email=data.get('customer_email')).first()
+        product = Product.query.filter_by(name=data.get('product_name')).first()
+
+        if not customer or not product:
+            return jsonify({'message': 'Customer or Product not found'}), 404
+
+        order.customer_id = customer.customer_id
+        order.product_id = product.product_id
         order.quantity = data.get('quantity', order.quantity)
+        
         db.session.commit()
+
         return jsonify({'message': 'Order updated successfully'})
     else:
         return jsonify({'message': 'Order not found'}), 404
@@ -93,11 +114,11 @@ def get_customers_by_products():
         .group_by(Customer.customer_id) \
         .all()
 
-    return jsonify({'customers': [{'customer_id': customer.Customer.customer_id,
-                                   'first_name': customer.Customer.first_name,
-                                   'last_name': customer.Customer.last_name,
-                                   'email': customer.Customer.email,
-                                   'total_products': customer.total_products} for customer in customers]})
+    return jsonify({'customers': [{'customer_id': customer.customer_id,
+                               'first_name': customer.first_name,
+                               'last_name': customer.last_name,
+                               'email': customer.email,
+                               'total_products': customer.total_products} for customer, total_products in customers]})
 
 # Get purchase history for a customer
 @app.route('/customers/<int:customer_id>/purchase-history')
@@ -123,6 +144,19 @@ def getAllCustomers():
 def getAllProducts():
     products = Product.query.all()
     return jsonify({"products": [product.name for product in products]})
+
+@app.route("/product/<int:id>")
+def getProductById(id):
+    product = Product.query.get(id)
+    if not product:
+        return jsonify({"error": "Product not found"}), 404
+    return jsonify({"Product": product.name})
+
+def success_response(message):
+    return jsonify({'success': True, 'message': message}), 200
+
+def error_response(message, status_code):
+    return jsonify({'success': False, 'error': message}), status_code
 
 if __name__ == '__main__':
     with app.app_context():
