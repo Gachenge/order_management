@@ -1,10 +1,14 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import os
 
+load_dotenv('.env')
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+mysqlconnector://Gachenge:pythonroot@Gachenge.mysql.pythonanywhere-services.com/Gachenge$orders'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('SQLALCHEMY_DATABASE_URI')
 
 db = SQLAlchemy(app)
 
@@ -43,120 +47,220 @@ class Order(db.Model):
 @app.route('/orders', methods=['POST'])
 def create_order():
     data = request.get_json()
-    required_attributes = []
+    allowed_attributes = ['customer_id', 'product_id', 'quantity']
+
+    if not data or not all(key in data for key in allowed_attributes):
+        return jsonify({"Error": "Missing or invalid data"}), 400
+
+    time_threshold = datetime.utcnow() - timedelta(seconds=60)
+    existing_order = Order.query.filter(
+        Order.customer_id == data['customer_id'],
+        Order.product_id == data['product_id'],
+        Order.created_at > time_threshold
+    ).first()
+
+    if existing_order:
+        return jsonify({'message': 'Order already placed for the same customer and product within a short time frame'}), 400
+
     new_order = Order(**data)
     db.session.add(new_order)
     db.session.commit()
+
     return jsonify({'message': 'Order created successfully'}), 201
 
 # Get all orders
 @app.route('/orders')
 def get_all_orders():
     orders = Order.query.all()
-    if orders is None or len(orders) == 0:
-        return (error_response("orders not found"), 404)
-    return jsonify({'orders': [{'order_id': order.order_id, 'customer_id': order.customer_id,
-                                'product_id': order.product_id, 'quantity': order.quantity,
-                                'created_at': order.created_at} for order in orders]}), 200
+    
+    if not orders:
+        return error_response("Orders not found"), 404
+
+    orders_data = [
+        {
+            'order_id': order.order_id,
+            'customer_id': order.customer_id,
+            'product_id': order.product_id,
+            'quantity': order.quantity,
+            'created_at': order.created_at
+        }
+        for order in orders
+    ]
+
+    return jsonify({'orders': orders_data}), 200
 
 # Get order by ID
 @app.route('/orders/<int:order_id>')
 def get_order_by_id(order_id):
-    order = Order.query.get(order_id)
-    if order:
-        return jsonify({'order_id': order.order_id, 'customer_id': order.customer_id,
-                        'product_id': order.product_id, 'quantity': order.quantity,
-                        'created_at': order.created_at})
-    else:
-        return jsonify({'message': 'Order not found'}), 404
+    order = Order.query.get_or_404(order_id)
+    
+    order_data = {
+        'order_id': order.order_id,
+        'customer_id': order.customer_id,
+        'product_id': order.product_id,
+        'quantity': order.quantity,
+        'created_at': order.created_at
+    }
 
-# Update order by ID
+    return jsonify({'order': order_data})
+
 @app.route('/orders/<int:order_id>', methods=['PUT'])
 def update_order(order_id):
     order = Order.query.get(order_id)
-    if order:
-        data = request.get_json()
-        if data is None or 'customer_email' not in data or 'product_name' not in data or 'quantity' not in data:
-            return jsonify({"Error": "Missing required data (customer_email, product_name, quantity)"}), 400
-
-        customer = Customer.query.filter_by(email=data.get('customer_email')).first()
-        product = Product.query.filter_by(name=data.get('product_name')).first()
-
-        if not customer or not product:
-            return jsonify({'message': 'Customer or Product not found'}), 404
-
-        order.customer_id = customer.customer_id
-        order.product_id = product.product_id
-        order.quantity = data.get('quantity', order.quantity)
-        
-        db.session.commit()
-
-        return jsonify({'message': 'Order updated successfully'})
-    else:
+    
+    if not order:
         return jsonify({'message': 'Order not found'}), 404
+
+    data = request.get_json()
+    allowed_attributes = ['customer_name', 'product_name', 'quantity']
+
+    if data is None or not set(data.keys()).issubset(allowed_attributes):
+        return jsonify({"Error": "Invalid or missing data"}), 400
+
+    for key, value in data.items():
+        if key == 'customer_name':
+            customer = Customer.query.filter_by(name=value).first()
+            if not customer:
+                return jsonify({'message': 'Customer not found'}), 404
+            if customer.customer_id != order.customer_id:
+                order.customer_id = customer.customer_id
+
+        elif key == 'product_name':
+            product = Product.query.filter_by(name=value).first()
+            if not product:
+                return jsonify({'message': 'Product not found'}), 404
+            if product.product_id != order.product_id:
+                order.product_id = product.product_id
+
+        elif key == 'quantity':
+            order.quantity = value
+
+        else:
+            return jsonify({"Error": f"You cannot change the {key} attribute"}), 403
+
+    db.session.commit()
+
+    return jsonify({'message': 'Order updated successfully'})
 
 # Delete order by ID
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
 def delete_order(order_id):
-    order = Order.query.get(order_id)
-    if order:
+    order = Order.query.get_or_404(order_id)
+
+    try:
         db.session.delete(order)
         db.session.commit()
         return jsonify({'message': 'Order deleted successfully'})
-    else:
-        return jsonify({'message': 'Order not found'}), 404
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'message': 'Error deleting order', 'error': str(e)}), 500
 
 # Get customers by the number of products they've bought
 @app.route('/customers/number-of-products')
 def get_customers_by_products():
-    customers = db.session.query(Customer, db.func.count(Order.customer_id).label('total_products')) \
-        .join(Order, Customer.customer_id == Order.customer_id) \
-        .group_by(Customer.customer_id) \
-        .all()
+    try:
+        customers_query = db.session.query(Customer, db.func.count(Order.customer_id).label('total_products')) \
+            .join(Order, Customer.customer_id == Order.customer_id) \
+            .group_by(Customer.customer_id) \
+            .all()
 
-    return jsonify({'customers': [{'customer_id': customer.customer_id,
-                               'first_name': customer.first_name,
-                               'last_name': customer.last_name,
-                               'email': customer.email,
-                               'total_products': customer.total_products} for customer, total_products in customers]})
+        customers_data = [
+            {
+                'customer_id': customer.customer_id,
+                'first_name': customer.first_name,
+                'last_name': customer.last_name,
+                'email': customer.email,
+                'total_products': total_products
+            }
+            for customer, total_products in customers_query
+        ]
+
+        return jsonify({'customers': customers_data})
+
+    except Exception as e:
+        return jsonify({'message': 'Error fetching customers', 'error': str(e)}), 500
 
 # Get purchase history for a customer
 @app.route('/customers/<int:customer_id>/purchase-history')
 def get_purchase_history(customer_id):
-    customer = Customer.query.get(customer_id)
-    if customer:
+    try:
+        customer = Customer.query.get(customer_id)
+
+        if not customer:
+            return jsonify({'message': 'Customer not found'}), 404
+
         orders = Order.query.filter_by(customer_id=customer_id).all()
-        return jsonify({'purchase_history': [{'order_id': order.order_id,
-                                              'product_id': order.product_id,
-                                              'quantity': order.quantity,
-                                              'created_at': order.created_at} for order in orders]})
-    else:
-        return jsonify({'message': 'Customer not found'}), 404
+
+        purchase_history = [
+            {
+                'order_id': order.order_id,
+                'product_id': order.product_id,
+                'quantity': order.quantity,
+                'created_at': order.created_at,
+                'product_name': order.product.name
+            }
+            for order in orders
+        ]
+
+        return jsonify({'purchase_history': purchase_history})
+
+    except Exception as e:
+        return jsonify({'message': 'Error fetching purchase history', 'error': str(e)}), 500
 
 # Get all customers
 @app.route("/customers")
-def getAllCustomers():
+def get_all_customers():
     customers = Customer.query.all()
-    return jsonify({"customers": [customer.email for customer in customers]})
+
+    if not customers:
+        return jsonify({"error": "No customers data"}), 404
+
+    customer_data = [
+        {
+            "customer_id": customer.customer_id,
+            "email": customer.email,
+            "first_name": customer.first_name,
+            "last_name": customer.last_name
+        }
+        for customer in customers
+    ]
+
+    return jsonify({"data": customer_data})
 
 # Get all products
 @app.route("/products")
-def getAllProducts():
+def get_all_products():
     products = Product.query.all()
-    return jsonify({"products": [product.name for product in products]})
 
+    if not products:
+        return jsonify({"error": "No products data"}), 404
+
+    product_data = [
+        {
+            "product_id": product.product_id,
+            "name": product.name,
+            "price": product.price
+        }
+        for product in products
+    ]
+
+    return jsonify({"data": product_data})
+
+# Get product by ID
 @app.route("/product/<int:id>")
-def getProductById(id):
+def get_product_by_id(id):
     product = Product.query.get(id)
+
     if not product:
         return jsonify({"error": "Product not found"}), 404
-    return jsonify({"Product": product.name})
 
-def success_response(message):
-    return jsonify({'success': True, 'message': message}), 200
+    product_data = {
+        "product_id": product.product_id,
+        "name": product.name,
+        "price": product.price
+    }
 
-def error_response(message, status_code):
-    return jsonify({'success': False, 'error': message}), status_code
+    return jsonify({"data": product_data})
 
 if __name__ == '__main__':
     with app.app_context():
